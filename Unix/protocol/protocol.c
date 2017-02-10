@@ -1732,25 +1732,24 @@ MI_Result ProtocolSocketAndBase_New_Connector(
         h->base.mask = SELECTOR_READ | SELECTOR_WRITE | SELECTOR_EXCEPTION;
         h->authState = PRT_AUTH_WAIT_CONNECTION_RESPONSE;
 
-        r = _AddProtocolSocket_Handler(self->internalProtocolBase.selector, h);
-
-        if (r != MI_RESULT_OK)
-        {
-            Sock_Close(connector);
-            _ProtocolSocketAndBase_Delete(self);
-            return r;
-        }
-
         /* send connect request */
         if( !_SendAuthRequest(h, user, password, NULL) )
         {
             // this will call _RequestCallback which will schedule a CloseOther,
             // but that is not going delete the object (since it is not even truly opened),
             // so do it explicitely
-            Selector_RemoveHandler(self->internalProtocolBase.selector, &h->base);
+            Sock_Close(connector);
             _ProtocolSocketAndBase_Delete(self);
             return MI_RESULT_FAILED;
         }
+    }
+
+    r = _AddProtocolSocket_Handler(self->internalProtocolBase.selector, &self->protocolSocket);
+    if (r != MI_RESULT_OK)
+    {
+        Sock_Close(connector);
+        _ProtocolSocketAndBase_Delete(self);
+        return r;
     }
 
     /* Set output parameter */

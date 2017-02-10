@@ -59,6 +59,7 @@ typedef struct _EnumerationState
     MI_Boolean xmlSet;
     MI_Boolean firstResponse;
     XML_Elem e;
+    ptrdiff_t refcount;
 }EnumerationState;
 
 typedef struct _SocketState
@@ -221,19 +222,6 @@ static void HttpClientCallbackOnStatusFn2(
     }
     return;
 
-#if 0
-
-    {
-        MI_Uint64 currentTimeUsec = 0;
-        ProtocolBase* protocolBase = (ProtocolBase*)self->base.data;
-
-        trace_ProtocolSocket_TimeoutTrigger( self );
-        // provoke a timeout to close/delete the socket
-        PAL_Time(&currentTimeUsec);
-        self->base.fireTimeoutAt = currentTimeUsec;
-        Selector_Wakeup(HttpClient_GetSelector(self->httpClient), MI_TRUE );
-    }
-#endif
 }
 
 void _WsmanClient_Post( _In_ Strand* self_, _In_ Message* msg);
@@ -299,6 +287,8 @@ static MI_Boolean ProcessNormalResponse(WsmanClient *self, Page **data)
     PostInstanceMsg *msg = NULL;
     MI_ConstString context = NULL;
     XML *xml;
+    MI_Boolean retVal = MI_FALSE;
+    EnumerationState *enumerationState = NULL;
 
     memset(&wsheaders, 0, sizeof(wsheaders));
 #ifndef DISABLE_SHELL
@@ -466,16 +456,39 @@ static MI_Boolean ProcessNormalResponse(WsmanClient *self, Page **data)
         *data = NULL;
     }
 
+    /* If enumerationState is present we need to bump refcount otherwise it
+     * may get deleted from under our feet and we cannot determine if we
+     * are done or not after that
+     */
+    enumerationState = self->enumerationState;
+    if (enumerationState)
+    {
+        Atomic_Inc(&enumerationState->refcount);
+    }
+
+
     PostInstance(self, msg);
 
-    if (self->enumerationState)
+    if (enumerationState)
     {
-        return self->enumerationState->endOfSequence ? MI_FALSE : MI_TRUE;
+        retVal = enumerationState->endOfSequence ? MI_FALSE : MI_TRUE;
+        if ((Atomic_Dec(&enumerationState->refcount) == 0))
+        {
+            PAL_Free(enumerationState);
+        }
     }
     else
     {
-        return MI_FALSE;
+        retVal = MI_FALSE;
     }
+
+ 
+    /* NOTE: IF THIS IS THE LAST INSTANCE EVERYTHING GETS DELETED SO DON'T TOUCH
+     * self IN THIS CASE OR IT WILL CRASH. 
+     * All state management needs to be done before.
+     */
+
+    return retVal;
 
 error:
     if (self->enumerationState)
@@ -888,12 +901,13 @@ void _WsmanClient_Post( _In_ Strand* self_, _In_ Message* msg)
 
                 // save these for PullReq
                 self->enumerationState = (EnumerationState*)
-                    Batch_GetClear(self->batch, sizeof(EnumerationState));
+                    PAL_Calloc(1, sizeof(EnumerationState));
                 if (!self->enumerationState)
                 {
                     miresult = MI_RESULT_SERVER_LIMITS_EXCEEDED;
                     break;
                 }
+                self->enumerationState->refcount = 1;
 
                 self->enumerationState->nameSpace = Batch_Tcsdup(self->batch, enumerateRequest->nameSpace);
                 if (self->enumerationState->nameSpace == NULL)
@@ -968,9 +982,6 @@ void _WsmanClient_Ack( _In_ Strand* self_)
     DEBUG_ASSERT( NULL != self_ );
 
     trace_ProtocolSocket_Ack( &self_->info.interaction, self_->info.interaction.other );
-//    if (!(self->base.mask & SELECTOR_WRITE))
-//       self->base.mask |= SELECTOR_READ;
-//    Selector_Wakeup(HttpClient_GetSelector(self->httpClient), MI_FALSE );
 
     if ((self->httpError != 200) ||!self->enumerationState || self->enumerationState->endOfSequence)
     {
@@ -1142,7 +1153,6 @@ void _WsmanClient_Finish( _In_ Strand* self_)
 void _WsmanClient_Aux_PostMsg( _In_ Strand* self_)
 {
     WsmanClient* self = FromOffset( WsmanClient, strand, self_ );
-//    ProtocolBase* protocolBase = (ProtocolBase*)self->base.data;
     Message * msg = self->strand.info.otherMsg;
 
     self->strand.info.otherMsg = NULL;
@@ -1150,18 +1160,6 @@ void _WsmanClient_Aux_PostMsg( _In_ Strand* self_)
     if( !self->strand.info.thisClosedOther )
     {
         // process the case where the interaction for the connection has not been opened yet
-#if 0
-        if( NULL != protocolBase->callback && NULL == self->strand.info.interaction.other )
-        {
-            Strand_Open( self_, protocolBase->callback, protocolBase->callbackData, NULL, MI_FALSE );
-        }
-        if( Message_IsRequest(msg) )
-        {
-            RequestMsg* request = (RequestMsg*)msg;
-            AuthInfo_Copy( &request->authInfo, &self->authInfo );
-        }
-#endif
-
         DEBUG_ASSERT( NULL != self->strand.info.interaction.other );
 
         // Leave the strand for the case where this is a new request on server
@@ -1248,6 +1246,7 @@ MI_Result WsmanClient_New_Connector(
     Strand_Init( STRAND_DEBUG(WsmanClientConnector) &self->strand, &_WsmanClient_FT, STRAND_FLAG_ENTERSTRAND, params);
 
     Strand_SetDelayFinish(&self->strand);
+
     Strand_Leave(&self->strand);
 
     self->ackState = ACKSTATE_IDLE;
@@ -1485,6 +1484,10 @@ finished2:
 MI_Result WsmanClient_Delete(WsmanClient *self)
 {
     HttpClient_Delete(self->httpClient);
+    if (self->enumerationState && (Atomic_Dec(&self->enumerationState->refcount) == 0))
+    {
+        PAL_Free(self->enumerationState);
+    }
     Batch_Delete(self->batch);
 
     return MI_RESULT_OK;

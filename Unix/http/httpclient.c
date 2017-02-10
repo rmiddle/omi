@@ -862,6 +862,8 @@ static Http_CallbackResult _ReadData(
         /* Invoke user's callback with header information */
         HttpClient* self = (HttpClient*)handler->base.data;
         MI_Boolean lastChunk = MI_TRUE;
+        HttpClientCallbackOnStatus2 statusCallback = self->callbackOnStatus;
+        void *callbackContext = self->callbackData;
 
         if (handler->contentEnd >= 0 &&
             handler->contentEnd + 1 < handler->contentTotalLength)
@@ -879,7 +881,7 @@ static Http_CallbackResult _ReadData(
 
         /* status callback */
         handler->status = MI_RESULT_OK;
-        (*self->callbackOnStatus)( self, self->callbackData, MI_RESULT_OK, MI_T("Failed to read data from the host"), NULL);
+        statusCallback( self, callbackContext, MI_RESULT_OK, MI_T("Failed to read data from the host"), NULL);
     }
 
 
@@ -1475,11 +1477,12 @@ static MI_Boolean _RequestCallback(
 
     if ((mask & SELECTOR_REMOVE) != 0 || (mask & SELECTOR_DESTROY) != 0)
     {
-        HttpClient* self = (HttpClient*)handler->base.data;
+        //HttpClient* self = (HttpClient*)handler->base.data;
+        //self->connector = NULL;
 
         /* notify next stack layer */
-        if (handler->status != MI_RESULT_OK)
-            (*self->callbackOnStatus)(self, self->callbackData, handler->status, NULL, NULL);
+        //if (handler->status != MI_RESULT_OK)
+        //    (*self->callbackOnStatus)(self, self->callbackData, handler->status, NULL, NULL);
 
         /* Yeah, this is hokey, but we need to sleep here to let the */
                 /* subsystems have the opportunity to send the data before we close */
@@ -1490,33 +1493,22 @@ static MI_Boolean _RequestCallback(
         usleep(50);
 #endif
 
-        if (handler == NULL)
+        if (handler->username)
         {
-            LOGE2((ZT("_RequestCallback - The handler object was free'd under us!")));
-            return MI_TRUE;
+            PAL_Free(handler->username);
+            handler->username = NULL;
         }
-
-        if (self->connector)
+    
+        if (handler->user_domain)
         {
-            if (self->connector->username)
-            {
-                PAL_Free(self->connector->username);
-                self->connector->username = NULL;
-            }
-        
-            if (self->connector->user_domain)
-            {
-                PAL_Free(self->connector->user_domain);
-                self->connector->user_domain = NULL;
-            }
-        
-            if (self->connector->password)
-            {
-                PAL_Free(self->connector->password);
-                self->connector->password = NULL;
-            }
-
-            self->connector = NULL;
+            PAL_Free(handler->user_domain);
+            handler->user_domain = NULL;
+        }
+    
+        if (handler->password)
+        {
+            PAL_Free(handler->password);
+            handler->password = NULL;
         }
 
         if (handler->ssl)
@@ -2819,29 +2811,7 @@ MI_Result HttpClient_Delete(
         /* remove connector from handler */
         if (self->connector)
         {
-            if (self->connector->username)
-            {
-                PAL_Free(self->connector->username);
-                self->connector->username = NULL;
-            }
-        
-            if (self->connector->password)
-            {
-                PAL_Free(self->connector->password);
-                self->connector->password = NULL;
-            }
-        
-            if (self->connector->hostname)
-            {
-                PAL_Free(self->connector->hostname);
-                self->connector->hostname = NULL;
-            }
-            if (self->connector->hostHeader)
-            {
-                PAL_Free( self->connector->hostHeader);
-                self->connector->hostHeader = NULL;
-            }
-            Selector_RemoveHandler(self->selector, &self->connector->base);
+           Selector_RemoveHandler(self->selector, &self->connector->base);
         }
     }
 
