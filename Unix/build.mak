@@ -102,7 +102,7 @@ endif
 ifdef CONFIG_SINGLEIMAGE
   DIRECTORIES += image
 else
-  DIRECTORIES += server agent
+  DIRECTORIES += server agent engine
 endif
 
 ifeq ($(ENABLE_NATIVE_KITS),1)

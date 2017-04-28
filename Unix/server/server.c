@@ -7,352 +7,191 @@
 **==============================================================================
 */
 
-#include <limits.h>
-#include <protocol/protocol.h>
-#include <pal/sleep.h>
-#include <wsman/wsman.h>
-#include <provreg/provreg.h>
-#include <provmgr/provmgr.h>
-#include <disp/disp.h>
-#include <pal/strings.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sock/sock.h>
 #include <pal/dir.h>
-#include <base/log.h>
-#include <base/env.h>
-#include <base/process.h>
-#include <base/pidfile.h>
-#include <base/paths.h>
-#include <base/conf.h>
-#include <base/user.h>
-#include <base/omigetopt.h>
-#include <base/multiplex.h>
-#include <base/Strand.h>
-#include <pal/format.h>
-#include <pal/lock.h>
-
-#if defined(CONFIG_POSIX)
-# include <signal.h>
-# include <sys/wait.h>
-# include <pthread.h>
-#endif
-
-typedef struct _ServerData ServerData;
-
-typedef enum _ServerTransportType
-{
-    SRV_PROTOCOL,
-    SRV_WSMAN
-}
-ServerTransportType;
-
-typedef struct _ServerCallbackData
-{
-    ServerData*         data;
-    ServerTransportType type;
-}
-ServerCallbackData;
-
-struct _ServerData
-{
-    Disp            disp;
-    MuxIn           mux;
-    ProtocolBase*   protocol;
-    WSMAN**         wsman;
-    int             wsman_size;
-    Selector        selector;
-    MI_Boolean      selectorInitialized;
-    MI_Boolean      reloadDispFlag;
-    MI_Boolean      terminated;
-
-    /* pointers to self with different types - one per supported transport */
-    ServerCallbackData  protocolData;
-    ServerCallbackData  wsmanData;
-} ;
-
-typedef struct _Options
-{
-    MI_Boolean help;
-#if !defined(CONFIG_FAVORSIZE)
-    MI_Boolean trace;
-#endif
-    MI_Boolean httptrace;
-    MI_Boolean terminateByNoop;
-#if defined(CONFIG_POSIX)
-    MI_Boolean daemonize;
-    MI_Boolean stop;
-    MI_Boolean reloadConfig;
-    MI_Boolean reloadDispatcher;
-#endif
-    /* mostly for unittesting in non-root env */
-    MI_Boolean ignoreAuthentication;
-    MI_Boolean locations;
-    MI_Boolean logstderr;
-    unsigned short *httpport;
-    int httpport_size;
-    unsigned short *httpsport;
-    int httpsport_size;
-    char* sslCipherSuite;
-    SSL_Options sslOptions;
-    MI_Uint64 idletimeout;
-    MI_Uint64 livetime;
-    Log_Level logLevel;
-    char *ntlmCredFile;
-}
-Options;
-
-static Lock s_disp_mutex = LOCK_INITIALIZER;
+#include <server/server.h>
 
 static Options s_opts;
 
 static ServerData s_data;
 
-static const char* arg0 = 0;
-
-static const ZChar HELP[] = ZT("\
-Usage: %s [OPTIONS]\n\
-\n\
-This program starts the server.\n\
-\n\
-OPTIONS:\n\
-    -h, --help                  Print this help message.\n\
-    -d                          Daemonize the server process (POSIX only).\n\
-    -s                          Stop the server process (POSIX only).\n\
-    -r                          Re-read configuration by the running server (POSIX only).\n\
-    --reload-dispatcher         Re-read configuration by the running server (POSIX only), but don't unload providers.\n\
-    --httpport PORT             HTTP protocol listener port.\n\
-    --httpsport PORT            HTTPS protocol listener port.\n\
-    --idletimeout TIMEOUT       Idle providers unload timeout (in seconds).\n\
-    -v, --version               Print version information.\n\
-    -l, --logstderr             Send log output to standard error.\n\
-    --loglevel LEVEL            Set logging level to one of the following\n\
-                                symbols/numbers: fatal/0, error/1, warning/2,\n\
-                                info/3, debug/4, verbose/5 (default 2).\n\
-    --httptrace                 Enable logging of HTTP traffic.\n\
-    --timestamp                 Print timestamp server was built with.\n\
-\n");
-
-STRAND_DEBUGNAME( NoopRequest )
-
-static void FUNCTION_NEVER_RETURNS err(const ZChar* fmt, ...)
+static int _StartEngine(int argc, char** argv, const char *sockFile)
 {
-    va_list ap;
-    memset(&ap, 0, sizeof(ap));
+    Sock s[2];
+    char engineFile[PAL_MAX_PATH_SIZE];
+    pid_t child;
+    int fdLimit;
+    int fd;
 
-    Ftprintf(stderr, ZT("%s: "), scs(arg0));
+    Strlcpy(engineFile, OMI_GetPath(ID_BINDIR), PAL_MAX_PATH_SIZE);
+    Strlcat(engineFile, "/omiengine", PAL_MAX_PATH_SIZE);
+    argv[0] = engineFile;
 
-    va_start(ap, fmt);
-    Vftprintf(stderr, fmt, ap);
-    va_end(ap);
+    BinaryProtocolListen(sockFile);
+    
+    if(socketpair(AF_UNIX, SOCK_STREAM, 0, s) != 0)
+    {
+        err(ZT("failed to create unix-domain socket pair"));
+        return -1;
+    }
 
-    /* Write to log as well */
-    va_start(ap, fmt);
-    __LOGE((fmt, ap));
-    va_end(ap);
+    if (MI_RESULT_OK != Sock_SetBlocking(s[0], MI_FALSE) ||
+        MI_RESULT_OK != Sock_SetBlocking(s[1], MI_FALSE))
+    {
+        trace_SetNonBlocking_Failed();
+        return -1;
+    }
 
-    Ftprintf(stderr, ZT("\n"));
+    child = fork();
+    if (child < 0)
+        return -1;  
+
+    if (child > 0)   // parent
+    {
+        Sock_Close(s[1]);
+        return 0;
+    }
+
+    // child code here
+
+    Sock_Close(s[0]);
+
+    if (SetUser(s_opts.serviceAccountUID, s_opts.serviceAccountGID) != 0)
+    {
+        err(PAL_T("failed to change uid/gid of engine"));
+        return -1;
+    }  
+
+    /* Close all open file descriptors except provided socket
+     (Some systems have UNLIMITED of 2^64; limit to something reasonable) */
+
+    fdLimit = getdtablesize();
+    if (fdLimit > 2500 || fdLimit < 0)
+    {
+        fdLimit = 2500;
+    }
+
+    /* ATTN: close first 3 also! Left for debugging only */
+    for (fd = 3; fd < fdLimit; ++fd)
+    {
+        if (fd != s[1])
+            close(fd);
+    }
+
+    execv(argv[0], argv);
+    err(PAL_T("Launch failed"));
     exit(1);
 }
 
-static void FUNCTION_NEVER_RETURNS info_exit(const ZChar* fmt, ...)
+static char** _DuplicateArgv(int argc, const char* argv[])
 {
-    va_list ap;
-    memset(&ap, 0, sizeof(ap));
+    int i;
 
-    Ftprintf(stderr, ZT("%s: "), scs(arg0));
+    char **newArgv = malloc((argc+1)*sizeof(char*));
 
-    va_start(ap, fmt);
-    Vftprintf(stderr, fmt, ap);
-    va_end(ap);
-
-    /* Write to log as well */
-    va_start(ap, fmt);
-    __LOGI((fmt, ap));
-    va_end(ap);
-
-    Ftprintf(stderr, ZT("\n"));
-    exit(0);
-}
-
-void PrintProviderMsg( _In_ Message* msg)
-{
-#if !defined(CONFIG_FAVORSIZE)
-    if (s_opts.trace)
+    // argv[0] will be filled in later
+    if (argc > 1)
     {
-        switch ( msg->tag )
+        for (i = 1; i<argc; ++i)
         {
-            case PostResultMsgTag:
-            {
-                const PostResultMsg* rsp = (const PostResultMsg*)msg;
-                PostResultMsg_Print(rsp, stdout);
-            }
-            break;
-
-            case PostInstanceMsgTag:
-            {
-                const PostInstanceMsg* rsp = (const PostInstanceMsg*)msg;
-                PostInstanceMsg_Print(rsp, stdout);
-            }
-            break;
-
-            case PostSchemaMsgTag:
-            {
-                const PostSchemaMsg* rsp = (const PostSchemaMsg*)msg;
-                PostSchemaMsg_Print(rsp, stdout);
-            }
-            break;
-
-            case NoOpRspTag:
-                break;  // send noop confirmation to the client 
-
-            default:
-            {
-                trace_UnknownMessageType(msg->tag);
-                exit(1);
-            }
+            newArgv[i] = strdup(argv[i]);
         }
     }
-#endif // !defined(CONFIG_FAVORSIZE)
+    newArgv[argc] = NULL;
+
+    return newArgv;
 }
 
-/*
-    Simple interaction object to respond to the noop request.
-    It just sends a noop response and closes the interaction
-    (therefore shutting down)
-*/
-void _NoopInteractionAck( _In_ Strand* self) 
+static int _GenerateRandomFileName(char *buffer, int length)
 {
-    // do nothing
+    const char letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    time_t t;
+    int i;
+
+    if (length > PAL_MAX_PATH_SIZE - 1)
+        length = PAL_MAX_PATH_SIZE - 1;
+
+    srand((unsigned) time(&t));
+    for (i=0; i<length - 1; ++i)
+    {
+        buffer[i] = letters[rand() % sizeof(letters)];
+    }
+    buffer[length - 1] = '\0';
+
+    return 0;
 }
 
-StrandFT _NoopInteractionUserFT = { 
-        NULL, 
-        NULL, 
-        _NoopInteractionAck, 
-        NULL, 
-        NULL, 
-        NULL,
-        NULL,
-        NULL, 
-        NULL, 
-        NULL, 
-        NULL, 
-        NULL };
-
-static void _ProcessNoopRequest(
-    _Inout_     InteractionOpenParams*  params )
+static int _CreateSockFile(char* buffer, int size)
 {
-    Strand* strand;
-    NoOpReq* req = (NoOpReq*)params->msg;
-    NoOpRsp* rsp;
+#define SOCKET_FILE_NAME_LENGTH 10
+    char sockDir[PAL_MAX_PATH_SIZE];
+    char file[PAL_MAX_PATH_SIZE];
+    char name[SOCKET_FILE_NAME_LENGTH];
 
-#if !defined(CONFIG_FAVORSIZE)
-    if (s_opts.trace)
+    Strlcpy(sockDir, OMI_GetPath(ID_SYSCONFDIR), PAL_MAX_PATH_SIZE);
+    Strlcat(sockDir, "/sockets", PAL_MAX_PATH_SIZE);
+
+    Dir *dir = Dir_Open(sockDir);
+    if (dir)
     {
-        NoOpReq_Print(req, stdout);
-    }
-#endif
-            
-    strand = Strand_New( STRAND_DEBUG( NoopRequest ) &_NoopInteractionUserFT, 0, STRAND_FLAG_ENTERSTRAND, params );
+        DirEnt *entry;
+        while((entry = Dir_Read(dir)))
+        {
+            if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0)
+                continue;
 
-    if( NULL == strand )
+            Strlcpy(file, sockDir, PAL_MAX_PATH_SIZE);
+            Strlcat(file, "/", PAL_MAX_PATH_SIZE);
+            Strlcat(file, entry->name, PAL_MAX_PATH_SIZE);
+            printf("Removing %s...\n", file);
+            unlink(file);
+        }
+    }
+    else
     {
-        err(ZT("out of memory"));
-        trace_OutOfMemory();
-        Strand_FailOpen(params);
-        return;
+        int r;
+        r = Mkdir(sockDir, 700);
+        if (r != 0)
+        {
+            err(PAL_T("failed to create sockets directory: %T"), tcs(sockDir));
+            return -1;
+        }
+
+        r = chown(sockDir, s_opts.serviceAccountUID, s_opts.serviceAccountGID);
+        if (r != 0)
+        {
+            err(PAL_T("failed to chown sockets directory: %T"), tcs(sockDir));
+            return -1;
+        }
     }
-
-    /* Send NoOp response back */
-    rsp = NoOpRsp_New(req->base.base.operationId);
-
-    if (!rsp)
+        
+    if ( _GenerateRandomFileName(name, SOCKET_FILE_NAME_LENGTH - 1) != 0)
     {
-        err(ZT("out of memory"));
-        trace_OutOfMemory();
-        Strand_FailOpen(params);
-        return;
+        err(PAL_T("Unable to generate socket file name"));
+        return -1;
     }
 
-#if !defined(CONFIG_FAVORSIZE)
-    if (s_opts.trace)
-    {
-        NoOpRsp_Print(rsp, stdout);
-    }
-#endif
-
-    Strand_Ack( strand );   // Ack open msg
-    Strand_Post( strand, &rsp->base );
-    Strand_Close( strand );   
-    Strand_Leave( strand);
-    
-    NoOpRsp_Release(rsp);
-
-    trace_ServerReceivedNoOpReqTag( (int)s_opts.terminateByNoop );
-    
-    if (s_opts.terminateByNoop)
-    {
-        s_data.terminated = MI_TRUE;
-        Selector_StopRunning(&s_data.selector);
-    }
+    Strlcpy(buffer, sockDir, size);
+    Strlcat(buffer, "/omi_", size);
+    Strlcat(buffer, name, size);
+    return 0;
 }
 
-/* Called by protocol stack to dispatch an incoming request message */
-static void _RequestCallback(
-    _Inout_ InteractionOpenParams* interactionParams )
-{
-    ServerCallbackData* self = (ServerCallbackData*)interactionParams->callbackData;
-    Message* msg = interactionParams->msg;
-    MI_Result result;
-
-    DEBUG_ASSERT( NULL != interactionParams );
-    DEBUG_ASSERT( NULL != msg );
-    
-    if (NoOpReqTag == msg->tag)
-    {
-        _ProcessNoopRequest( interactionParams );
-        return;
-    }
-
-#if !defined(CONFIG_FAVORSIZE)
-    if (s_opts.trace)
-    {
-        MessagePrint(msg, stdout);
-    }
-#endif
-    
-    Lock_Acquire(&s_disp_mutex);
-    result = Disp_HandleInteractionRequest(
-                &self->data->disp, 
-                interactionParams );
-    Lock_Release(&s_disp_mutex);
-    if( result != MI_RESULT_OK )
-    {
-        Strand_FailOpenWithResult(interactionParams, result, PostResultMsg_NewAndSerialize);
-    }
-}
- 
-static void GetCommandLineDestDirOption(
+static void _GetCommandLineNonRootOption(
     int* argc_,
     const char* argv[])
 {
     int argc = *argc_;
     int i;
-    const char* destdir = NULL;
+    s_opts.nonRoot = MI_FALSE;
 
     for (i = 1; i < argc; )
     {
-        if (strcmp(argv[i], "--destdir") == 0)
+        if (strncmp(argv[i], "--nonroot", 10) == 0)
         {
-            if (i + 1 == argc)
-                err(ZT("missing argument for --destdir option"));
-
-            destdir = argv[i+1];
-            memmove((char*)&argv[i], (char*)&argv[i+2], 
-                sizeof(char*) * (argc-i-1));
-            argc -= 2;
-        }
-        else if (strncmp(argv[i], "--destdir=", 10) == 0)
-        {
-            destdir = argv[i] + 10;
+            s_opts.nonRoot = MI_TRUE;
             memmove((char*)&argv[i], (char*)&argv[i+1], 
                 sizeof(char*) * (argc-i));
 
@@ -362,646 +201,31 @@ static void GetCommandLineDestDirOption(
             i++;
     }
 
-    if (destdir)
-    {
-        if (SetPath(ID_DESTDIR, destdir) != 0)
-            err(ZT("failed to set destdir"));
-    }
-
     *argc_ = argc;
-}
-
-/*
- * Parse an HTTP or HTTPS port specification:
- *
- *   "1270" would simply place 1270 in the list,
- *   "1270,5599" would place port 1270 and port 5599 to the list
- *
- * Returns 0 if parameter was good, non-zero if parameter was bad
- */
-static int ParseHttpPortSpecification(unsigned short **ports, int *size, const char *spec, unsigned short defport)
-{
-    // defport is unused (no longer support "+" to add default port
-    (void) defport;
-
-    // Ignore anything that is already stored
-    *size = 0;
-
-    // Skip leading spaces
-    char *saveptr;
-    char *ptr = (char *) spec;
-    while (*ptr == ' ')
-    {
-        ptr++;
-    }
-
-    while ( 1 )
-    {
-        unsigned long x;
-        char *end = NULL;
-
-        char *token = Strtok(ptr, ",", &saveptr);
-        ptr = NULL;
-        if (NULL == token)
-        {
-            break;
-        }
-
-        x = Strtoul(token, &end, 10);
-        if (*end != '\0' || x > USHRT_MAX)
-        {
-            return 1;
-        }
-
-        /* Don't add a port of '0' */
-        if ( x != 0 )
-        {
-            /* Don't add duplicate ports; just ignore second port */
-            int found = 0, i;
-            for (i = 0; i < (*size); ++i)
-            {
-                if ( (*ports)[i] == x )
-                {
-                    found = 1;
-                    break;
-                }
-            }
-
-            if ( ! found )
-            {
-                int bytes = ++(*size) * sizeof(unsigned int);
-                *ports = PAL_Realloc(*ports, bytes);
-                if ( (*ports) == 0 )
-                {
-                    err(ZT("memory allocation failure allocating %d bytes"), bytes);
-                }
-
-                (*ports)[(*size) - 1] = x;
-            }
-        }
-    }
-
-    return 0;
-}
-
-static void GetCommandLineOptions(
-    int* argc_,
-    const char* argv[])
-{
-    int argc = *argc_;
-    GetOptState state = GETOPTSTATE_INITIALIZER;
-    static const char* opts[] =
-    {
-        "-h",
-        "--help",
-        "-p",
-        "-t",
-        "--httptrace",
-        "--timestamp",
-        "--stopnoop",
-        "-v",
-        "--version",
-        "-d",
-        "-s",
-        "-r",
-        "--httpport:",
-        "--httpsport:",
-        "--idletimeout:",
-        "--livetime:",
-        "--ignoreAuthentication",
-        "-i",
-        "--prefix:",
-        "--libdir:",
-        "--bindir:",
-        "--localstatedir:",
-        "--sysconfdir:",
-        "--providerdir:",
-                "--registerdir:",
-        "--certsdir:",
-        "--rundir:",
-        "--logdir:",
-        "--pidfile:",
-        "--logfile:",
-        "--configfile:",
-        "--socketfile:",
-        "--pemfile:",
-        "--keyfile:",
-        "--agentprogram:",
-        "--serverprogram:",
-        "--logstderr",
-        "--loglevel:",
-        "-l",
-        "--testopts",
-        "--reload-dispatcher",
-        NULL,
-    };
-
-    for (;;)
-    {
-        int r = GetOpt(&argc, argv, opts, &state);
-
-        if (r == 1)
-            break;
-
-        if (r == -1)
-        {
-            Ftprintf(stderr, ZT("error: %s\n"), scs(state.err));
-            exit(1);
-        }
-
-        if (strcmp(state.opt, "-h") == 0 ||
-            strcmp(state.opt, "--help") == 0)
-        {
-            s_opts.help = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "-p") == 0)
-        {
-            s_opts.locations = MI_TRUE;
-        }
-#if !defined(CONFIG_FAVORSIZE)
-        else if (strcmp(state.opt, "-t") == 0)
-        {
-            s_opts.trace = MI_TRUE;
-        }
-#endif
-        else if (strcmp(state.opt, "--httptrace") == 0)
-        {
-            s_opts.httptrace = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "--timestamp") == 0)
-        {
-#if defined(CONFIG_OS_WINDOWS)
-            Tprintf(PAL_T("%s: %T\n"), scs(arg0), tcs(CONFIG_TIMESTAMP));
-#else
-            Tprintf(ZT("%s: %s\n"), scs(arg0), scs(CONFIG_TIMESTAMP));
-#endif
-            exit(0);
-        }
-        else if (strcmp(state.opt, "--stopnoop") == 0)
-        {
-            s_opts.terminateByNoop = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "-v") == 0 ||
-                strcmp(state.opt, "--version") == 0)
-        {
-#if defined(CONFIG_OS_WINDOWS)
-            Tprintf(PAL_T("%s: %T\n"), scs(arg0),
-                tcs(CONFIG_PRODUCT PAL_T("-") CONFIG_VERSION PAL_T(" - ") CONFIG_DATE));
-#else
-            Tprintf(ZT("%s: %s\n"), scs(arg0),
-                scs(CONFIG_PRODUCT "-" CONFIG_VERSION " - " CONFIG_DATE));
-#endif
-            exit(0);
-        }
-#if defined(CONFIG_POSIX)
-        else if (strcmp(state.opt, "-d") == 0)
-        {
-            s_opts.daemonize = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "-s") == 0)
-        {
-            s_opts.stop = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "-r") == 0)
-        {
-            s_opts.reloadConfig = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "--reload-dispatcher") == 0)
-        {
-            s_opts.reloadDispatcher = MI_TRUE;
-        }
-#endif
-        else if (strcmp(state.opt, "--httpport") == 0)
-        {
-            if ( ParseHttpPortSpecification(&s_opts.httpport, &s_opts.httpport_size, state.arg, CONFIG_HTTPPORT) )
-            {
-                err(ZT("bad option argument for --httpport: %s"), 
-                    scs(state.arg));
-            }
-        }
-        else if (strcmp(state.opt, "--httpsport") == 0)
-        {
-            if ( ParseHttpPortSpecification(&s_opts.httpsport, &s_opts.httpsport_size, state.arg, CONFIG_HTTPSPORT) )
-            {
-                err(ZT("bad option argument for --httpsport: %s"), 
-                    scs(state.arg));
-            }
-        }
-        else if (strcmp(state.opt, "--idletimeout") == 0)
-        {
-            char* end;
-            MI_Uint64 x = Strtoull(state.arg, &end, 10);
-
-            if (*end != '\0')
-            {
-                err(ZT("bad option argument for --idletimeout: %s"), 
-                    scs(state.arg));
-            }
-
-            s_opts.idletimeout = x;
-        }
-        else if (strcmp(state.opt, "--livetime") == 0)
-        {
-            char* end;
-            MI_Uint64 x = Strtoull(state.arg, &end, 10);
-
-            if (*end != '\0')
-            {
-                err(ZT("bad option argument for --livetime: %s"), 
-                    scs(state.arg));
-            }
-
-            s_opts.livetime = x;
-        }
-        else if (strcmp(state.opt, "--ignoreAuthentication") == 0 ||
-             strcmp(state.opt, "-i") == 0)
-        {
-            s_opts.ignoreAuthentication = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "--logstderr") == 0 ||
-             strcmp(state.opt, "-l") == 0)
-        {
-            s_opts.logstderr = MI_TRUE;
-        }
-        else if (strcmp(state.opt, "--loglevel") == 0)
-        {
-            if (Log_SetLevelFromString(state.arg) != 0)
-            {
-                err(ZT("bad option argument for %s: %s"), 
-                    scs(state.opt), scs(state.arg));
-            }
-        }
-        else if (strcmp(state.opt, "--testopts") == 0)
-        {
-            s_opts.httptrace = MI_TRUE;
-
-            if (Log_SetLevelFromString("DEBUG") != 0)
-            {
-                err(ZT("bad argument for Log_SetLevelFromString()"));
-            }
-        }
-        else if (strncmp(state.opt, "--", 2) == 0 && IsNickname(state.opt+2))
-        {
-            if (SetPathFromNickname(state.opt+2, state.arg) != 0)
-                err(ZT("SetPathFromNickname() failed"));
-        }
-    }
-
-    *argc_ = argc;
-}
-
-static void OpenLogFile()
-{
-    if (s_opts.logstderr)
-    {
-        if (Log_OpenStdErr() != MI_RESULT_OK)
-            err(ZT("failed to open log file to stderr"));
-    }
-    else
-    {
-        TChar path[PAL_MAX_PATH_SIZE];
-        TcsStrlcpy(path, OMI_GetPath(ID_LOGFILE), MI_COUNT(path));
-
-        /* Open the log file */
-        if (Log_Open(path) != MI_RESULT_OK)
-            err(PAL_T("failed to open log file: %T"), tcs(path));
-    }
-}
-
-#if defined(CONFIG_POSIX)
-
-static void _HandleSIGTERM(int sig)
-{
-    if (sig == SIGTERM && s_data.selectorInitialized)
-    {
-        const char* socketFile = OMI_GetPath(ID_SOCKETFILE);
-        s_data.terminated = MI_TRUE;
-        Selector_StopRunning(&s_data.selector);
-        if (socketFile != NULL && *socketFile != '\0')
-            unlink(socketFile);
-    }
-}
-
-static void _HandleSIGHUP(int sig)
-{
-    if (sig == SIGHUP && s_data.selectorInitialized)
-    {
-        Selector_StopRunning(&s_data.selector);
-    }
-}
-
-// We reload the ProvReg structure in the Dispatcher when this signal is received.
-// This gives us access to providers that are installed after the omiserver is running without terminating current providers that are running.
-static void _HandleSIGUSR1(int sig)
-{
-    if (sig == SIGUSR1)
-    {
-        s_data.reloadDispFlag = MI_TRUE;
-    }
-}
-
-/* An array of PIDS that abnormally exited */
-#define NPIDS 16
-static pid_t _pids[NPIDS];
-static volatile size_t _npids;
-
-static void _HandleSIGCHLD(int sig)
-{
-    if (sig == SIGCHLD)
-    {
-        for (;;)
-        {
-            int status = 0;
-            pid_t pid = waitpid(-1, &status, WNOHANG);
-
-            /* If abnormal exit, append to PIDs array */
-            if (pid > 0 && !WIFEXITED(status))
-            {
-                /* Save PID so error can be logged outside this function */
-                if (_npids < NPIDS)
-                    _pids[_npids++] = pid;
-            }
-
-            if (pid > 0 || (pid == -1 && errno == EINTR))
-                continue;
-
-            break;
-        }
-    }
-}
-
-#endif /* defined(CONFIG_POSIX) */
-
-static void _PrintPaths()
-{
-    PrintPaths();
-}
-
-static void GetConfigFileOptions()
-{
-    char path[PAL_MAX_PATH_SIZE];
-    Conf* conf;
-
-    /* Form the configuration file path */
-    Strlcpy(path, OMI_GetPath(ID_CONFIGFILE), sizeof(path));
-
-    /* Open the configuration file */
-    conf = Conf_Open(path);
-    if (!conf)
-        err(ZT("failed to open configuration file: %s"), scs(path));
-
-    /* For each key=value pair in configuration file */
-    for (;;)
-    {
-        const char* key;
-        const char* value;
-        int r = Conf_Read(conf, &key, &value);
-
-        if (r == -1)
-            err(ZT("%s: %s\n"), path, scs(Conf_Error(conf)));
-
-        if (r == 1)
-            break;
-
-        if (strcmp(key, "httpport") == 0)
-        {
-            if ( ParseHttpPortSpecification(&s_opts.httpport, &s_opts.httpport_size, value, CONFIG_HTTPPORT) )
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "httpsport") == 0)
-        {
-            if ( ParseHttpPortSpecification(&s_opts.httpsport, &s_opts.httpsport_size, value, CONFIG_HTTPSPORT) )
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "idletimeout") == 0)
-        {
-            char* end;
-            MI_Uint64 x = Strtoull(value, &end, 10);
-
-            if (*end != '\0')
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-
-            s_opts.idletimeout = x;
-        }
-        else if (strcmp(key, "livetime") == 0)
-        {
-            char* end;
-            MI_Uint64 x = Strtoull(value, &end, 10);
-
-            if (*end != '\0')
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-
-            s_opts.livetime = x;
-        }
-        else if (strcmp(key, "trace") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-#if !defined(CONFIG_FAVORSIZE)
-                s_opts.trace = MI_TRUE;
-#endif
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-#if !defined(CONFIG_FAVORSIZE)
-                s_opts.trace = MI_FALSE;
-#endif
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "httptrace") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.httptrace = MI_TRUE;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.httptrace = MI_FALSE;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "loglevel") == 0)
-        {
-            if (Log_SetLevelFromString(value) != 0)
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "sslciphersuite") == 0)
-        {
-            size_t valueLength = strlen(value);
-            s_opts.sslCipherSuite = PAL_Malloc(valueLength + 1);
-            if (s_opts.sslCipherSuite == NULL)
-                err(ZT("Out of memory"));
-            Strlcpy(s_opts.sslCipherSuite, value, valueLength+1);
-            s_opts.sslCipherSuite[valueLength] = '\0';
-        }
-        else if (strcmp(key, "NoSSLv2") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_SSL_V2;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_SSL_V2;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "NoSSLv3") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_SSL_V3;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_SSL_V3;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "NoTLSv1_0") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_TSL_V1_0;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_TSL_V1_0;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "NoTLSv1_1") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_TSL_V1_1;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_TSL_V1_1;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "NoTLSv1_2") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_TSL_V1_2;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_TSL_V1_2;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (strcmp(key, "NoSSLCompression") == 0)
-        {
-            if (Strcasecmp(value, "true") == 0)
-            {
-                s_opts.sslOptions |= DISABLE_SSL_COMPRESSION;
-            }
-            else if (Strcasecmp(value, "false") == 0)
-            {
-                s_opts.sslOptions &= ~DISABLE_SSL_COMPRESSION;
-            }
-            else
-            {
-                err(ZT("%s(%u): invalid value for '%s': %s"), scs(path),
-                    Conf_Line(conf), scs(key), scs(value));
-            }
-        }
-        else if (IsNickname(key))
-        {
-            if (SetPathFromNickname(key, value) != 0)
-                err(ZT("SetPathFromNickname() failed"));
-        }
-        else if (strcasecmp(key, "NtlmCredsFile") == 0)
-        {
-            if (value)
-            {
-                s_opts.ntlmCredFile = PAL_Strdup(value);
-            }
-        }
-        else
-        {
-            err(ZT("%s(%u): unknown key: %s"), scs(path), Conf_Line(conf), 
-                scs(key));
-        }
-    }
-
-    /* Close configuration file */
-    Conf_Close(conf);
-
-    return;
 }
 
 int servermain(int argc, const char* argv[])
 {
-    MI_Result r;
 #if defined(CONFIG_POSIX)
     int pidfile = -1;
 #endif
+    int engine_argc = 0;
+    char **engine_argv = NULL;
+    char socketFile[PAL_MAX_PATH_SIZE];
 
+    serverType = OMI_SERVER;
     arg0 = argv[0];
-
     memset(&s_data, 0, sizeof(s_data));
 
-    /* Set default options */
-    s_opts.httpport = PAL_Malloc(sizeof(unsigned short));
-    s_opts.httpport[0] = CONFIG_HTTPPORT;
-    s_opts.httpport_size = 1;
+    SetDefaults(&s_opts, &s_data, arg0);
 
-    s_opts.httpsport = PAL_Malloc(sizeof(unsigned short));
-    s_opts.httpsport[0] = CONFIG_HTTPSPORT;
-    s_opts.httpsport_size = 1;
-
-    s_opts.sslOptions = DISABLE_SSL_V2;
-    s_opts.idletimeout = 0;
-    s_opts.livetime = 0;
+    // Determine if we're running with non-root option
+    _GetCommandLineNonRootOption(&argc, argv);
+    if (s_opts.nonRoot == MI_TRUE)
+    {
+        engine_argc = argc;
+        engine_argv = _DuplicateArgv(argc, argv);
+    }
 
     /* Get --destdir command-line option */
     GetCommandLineDestDirOption(&argc, argv);
@@ -1025,7 +249,7 @@ int servermain(int argc, const char* argv[])
     /* Print locations of files and directories */
     if (s_opts.locations)
     {
-        _PrintPaths();
+        PrintPaths();
         Tprintf(ZT("\n"));
         exit(0);
     }
@@ -1078,14 +302,14 @@ int servermain(int argc, const char* argv[])
     }
 
     /* Watch for SIGTERM signals */
-    if (0 != SetSignalHandler(SIGTERM, _HandleSIGTERM) ||
-        0 != SetSignalHandler(SIGHUP, _HandleSIGHUP) ||
-        0 != SetSignalHandler(SIGUSR1, _HandleSIGUSR1))
+    if (0 != SetSignalHandler(SIGTERM, HandleSIGTERM) ||
+        0 != SetSignalHandler(SIGHUP, HandleSIGHUP) ||
+        0 != SetSignalHandler(SIGUSR1, HandleSIGUSR1))
         err(ZT("cannot set sighandler, errno %d"), errno);
 
 
     /* Watch for SIGCHLD signals */
-    SetSignalHandler(SIGCHLD, _HandleSIGCHLD);
+    SetSignalHandler(SIGCHLD, HandleSIGCHLD);
 
 #endif
 
@@ -1137,263 +361,51 @@ int servermain(int argc, const char* argv[])
        }
     }
 
+    if (s_opts.nonRoot == MI_TRUE)
+    {
+        int i, r;
 
-    /* Initialize calback parameters */
-    s_data.protocolData.data = &s_data;
-    s_data.protocolData.type = SRV_PROTOCOL;
-    s_data.wsmanData.data = &s_data;
-    s_data.wsmanData.type = SRV_WSMAN;
+        r = _CreateSockFile(socketFile, PAL_MAX_PATH_SIZE);
+        if (r != 0)
+        {
+            err(ZT("failed to create socket file"));
+            exit(1);
+        }
+
+        InitializeNetwork();
+
+        r = _StartEngine(engine_argc, engine_argv, socketFile);
+        if (r != 0)
+        {
+            err(ZT("failed to start omi engine"));
+            exit(1);
+        }
+
+        if (engine_argc > 1)
+        {
+            for (i=1; i<engine_argc; ++i)
+            {
+                free(engine_argv[i]);
+            }
+        }
+        free(engine_argv);
+    }
 
     while (!s_data.terminated)
     {
-        /* selector */
+        if (s_opts.nonRoot != MI_TRUE)
         {
-            /* Initialize the network */
-            Sock_Start();
+            InitializeNetwork();
 
-            if(Selector_Init(&s_data.selector) != MI_RESULT_OK)
-                err(ZT("Selector_Init() failed"));
+            WsmanProtocolListen();
 
-            s_data.selectorInitialized = MI_TRUE;
-
-            Timer_SetSelector(&s_data.selector);
+            BinaryProtocolListen(OMI_GetPath(ID_SOCKETFILE));
         }
 
-        /* Create the dispatcher object. */
-        {
-            r = Disp_Init(&s_data.disp, &s_data.selector);
-
-            if (r != MI_RESULT_OK)
-            {
-                trace_DispatchInitFailed(r);
-                err(ZT("failed to initialize the dispatcher: %u"), r);
-            }
-        }
-
-        if (s_opts.idletimeout)
-        {
-            /* convert it to usec */
-            s_data.disp.agentmgr.provmgr.idleTimeoutUsec = s_opts.idletimeout * 1000000;
-        }
-
-        /* Set WSMAN options and create WSMAN server */
-        s_data.wsman_size = s_opts.httpport_size + s_opts.httpsport_size;
-        if ( s_data.wsman_size > 0 )
-        {
-            s_data.wsman = PAL_Calloc(s_data.wsman_size, sizeof(WSMAN*));
-            if ( s_data.wsman == NULL )
-            {
-                err(ZT("memory allocation failure allocating %d bytes"), s_data.wsman_size * sizeof(WSMAN*));
-            }
-        }
-
-        {
-            int wsman_count = 0;
-            WSMAN_Options options = DEFAULT_WSMAN_OPTIONS;
-#if !defined(CONFIG_FAVORSIZE)
-            options.enableTracing = s_opts.trace;
-#endif
-            options.enableHTTPTracing = s_opts.httptrace;
-
-            /* Start up the non-encrypted listeners */
-            int count;
-            for ( count = 0; count < s_opts.httpport_size; ++count )
-            {
-                r = WSMAN_New_Listener(
-                    &s_data.wsman[wsman_count++],
-                    &s_data.selector, 
-                    s_opts.httpport[count],
-                    0,
-                    s_opts.sslCipherSuite,
-                    s_opts.sslOptions,
-                    _RequestCallback,
-                    &s_data.wsmanData,
-                    &options);
-
-                if (r != MI_RESULT_OK)
-                {
-                    err(ZT("WSMAN_New_Listener() failed for port %u"), s_opts.httpport[count]);
-                }
-
-                /* Log start up message */
-                trace_ListeningOnPort(s_opts.httpport[count]);
-            }
-
-            /* Start up the encrypted listeners */
-            for ( count = 0; count < s_opts.httpsport_size; ++count )
-            {
-                r = WSMAN_New_Listener(
-                    &s_data.wsman[wsman_count++],
-                    &s_data.selector, 
-                    0,
-                    s_opts.httpsport[count],
-                    s_opts.sslCipherSuite,
-                    s_opts.sslOptions,
-                    _RequestCallback,
-                    &s_data.wsmanData,
-                    &options);
-
-                if (r != MI_RESULT_OK)
-                {
-                    err(ZT("WSMAN_New_Listener() failed for encrypted port %u"), s_opts.httpsport[count]);
-                }
-
-                /* Log start up message */
-                trace_ListeningOnEncryptedPort(s_opts.httpsport[count]);
-            }
-        }
-
-        /* mux */
-        {
-            if(MuxIn_Init(&s_data.mux, _RequestCallback, &s_data.protocolData, NULL, PostResultMsg_NewAndSerialize) != MI_RESULT_OK)
-                err(ZT("MuxIn_Init() failed"));
-        }
-        
-        /* Create new protocol object */
-        {
-            r = ProtocolBase_New_Listener(
-                &s_data.protocol, 
-                &s_data.selector, 
-                OMI_GetPath(ID_SOCKETFILE), 
-                MuxIn_Open,
-                &s_data.mux);
-
-            if (r != MI_RESULT_OK)
-                err(ZT("Protocol_New_Listener() failed"));
-        }
-
-        /* Run the protocol object (waiting for new messages) */
-        {
-            const PAL_Uint64 ONE_SECOND_USEC = 1000 * 1000;
-            PAL_Uint64 start;
-            PAL_Uint64 finish;
-
-            PAL_Time(&start);
-
-            if (s_opts.livetime)
-                finish = start + (s_opts.livetime * ONE_SECOND_USEC);
-            else
-                finish = 0;
-
-            for (;;)
-            {
-                PAL_Uint64 now;
-                int reload_file_exists = access(CONFIG_LOCALSTATEDIR "/omiusers/reload_dispatcher", F_OK);
-
-                if (s_data.reloadDispFlag || 
-		    reload_file_exists == 0)
-                {
-                    Lock_Acquire(&s_disp_mutex);
-                    Disp_Reload(&s_data.disp);
-                    s_data.reloadDispFlag = MI_FALSE;
-                    Lock_Release(&s_disp_mutex);
-
-		    if (reload_file_exists == 0)
-		    {
-			unlink(CONFIG_LOCALSTATEDIR "/omiusers/reload_dispatcher");
-		    }
-                }
-
-                r = Protocol_Run(s_data.protocol, ONE_SECOND_USEC);
-
-                if (r != MI_RESULT_TIME_OUT)
-                    break;
-
-                PAL_Time(&now);
-
-                /* Log abnormally terminated terminated process */
-                {
-                    size_t i;
-
-                    for (i = 0; i < _npids; i++)
-                        trace_ChildProcessTerminatedAbnormally(_pids[i]);
-
-                    _npids = 0;
-                }
-
-                if (finish && now > finish)
-                    break;
-            }
-        }
-
-        trace_Server_ProtocolRun(r);
-
-        s_data.selectorInitialized = MI_FALSE;
-
-        if (MI_RESULT_TIME_OUT == r)
-        {
-            trace_Server_LiveTimeExpired();
-            s_data.terminated = MI_TRUE;
-        }
-
-#if defined(CONFIG_POSIX)
-        if (r == MI_RESULT_OK)
-        {
-            if (s_data.terminated)
-                trace_ServerTerminated();
-            else
-                trace_ServerReReadingConfig();
-        }
-#endif
-
-        // Destroy the dispatcher.
-        Selector_RemoveAllHandlers(&s_data.selector);
-        Disp_Destroy(&s_data.disp);
-
-        {
-            int i;
-            for (i = 0; i < s_data.wsman_size; ++i)
-            {
-                WSMAN_Delete(s_data.wsman[i]);
-            }
-        }
-
-        ProtocolBase_Delete(s_data.protocol);
-        Selector_Destroy(&s_data.selector);
-
-        /* Shutdown the network */
-        Sock_Stop();
+        RunProtocol();
     }
 
-    /* Done with WSMAN* array; free it */
-    PAL_Free(s_data.wsman);
-    s_data.wsman_size = 0;
-
-    /* Done with pointers to ports; free them now */
-    PAL_Free(s_opts.httpport);
-    PAL_Free(s_opts.httpsport);
-    s_opts.httpport_size = s_opts.httpsport_size = 0;
-
-#if defined(CONFIG_POSIX)
-    /* Close PID file */
-    close(pidfile);
-
-    /* Remove PID file */
-    if (PIDFile_Delete() != 0)
-    {
-        trace_FailedRemovePIDFile(scs(OMI_GetPath(ID_PIDFILE)));
-    }
-#endif
-
-    /* Log that we are exiting */
-    trace_ServerExiting();
-
-    Log_Close();
-
-#if defined(USE_ALLOCATOR)
-
-# if defined(USE_PAL_ATEXIT)
-    PAL_AtexitCall();
-# endif
-
-    PAL_DumpAllocStats();
-
-    if (PAL_GetBlocksAllocated())
-    {
-        printf("WARNING: %s: server has unfreed blocks on exit\n", arg0);
-        PAL_DumpAllocList();
-    }
-#endif
+    ServerCleanup(pidfile);
 
     return 0;
 }
