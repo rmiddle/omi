@@ -83,8 +83,12 @@ ServerCallbackData;
 struct _ServerData
 {
     Disp            disp;
-    MuxIn           mux;
-    ProtocolBase*   protocol;
+
+    // 0 = socketfile, 1 = socketpair
+    MuxIn           mux[2];
+    ProtocolBase *protocol0;
+    ProtocolSocketAndBase *protocol1;
+
     WSMAN**         wsman;
     int             wsman_size;
     Selector        selector;
@@ -149,7 +153,8 @@ void HandleSIGCHLD(int sig);
 void RequestCallback(_Inout_ InteractionOpenParams* interactionParams);
 void FUNCTION_NEVER_RETURNS err(const ZChar* fmt, ...);
 void FUNCTION_NEVER_RETURNS info_exit(const ZChar* fmt, ...);
-void BinaryProtocolListen(const char *socketFile);
+void BinaryProtocolListenFile(const char *socketFile, MuxIn *mux, ProtocolBase **protocol);
+void BinaryProtocolListenSock(Sock sock, MuxIn *mux, ProtocolSocketAndBase **protocol);
 void WsmanProtocolListen();
 void RunProtocol();
 void InitializeNetwork();

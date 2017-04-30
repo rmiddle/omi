@@ -781,6 +781,8 @@ void SetDefaults(_In_ Options *opts_ptr, _In_ ServerData *data_ptr, const char *
     s_dataPtr->wsmanData.data = s_dataPtr;
     s_dataPtr->wsmanData.type = SRV_WSMAN;
 
+    s_dataPtr->protocol0 = NULL;
+    s_dataPtr->protocol1 = NULL;
 }
 
 STRAND_DEBUGNAME( NoopRequest )
@@ -1023,28 +1025,54 @@ void WsmanProtocolListen()
     }
 }
 
-void BinaryProtocolListen(const char *socketFile)
+void BinaryProtocolListenFile(const char *socketFile, MuxIn *mux, ProtocolBase **protocol)
 {
     MI_Result r;
 
     /* mux */
     {
-        if(MuxIn_Init(&s_dataPtr->mux, RequestCallback, &s_dataPtr->protocolData, NULL, PostResultMsg_NewAndSerialize) != MI_RESULT_OK)
+        if(MuxIn_Init(mux, RequestCallback, &s_dataPtr->protocolData, NULL, PostResultMsg_NewAndSerialize) != MI_RESULT_OK)
             err(ZT("MuxIn_Init() failed"));
     }
         
     /* Create new protocol object */
     {
         r = ProtocolBase_New_Listener(
-            &s_dataPtr->protocol, 
+            protocol, 
             &s_dataPtr->selector, 
             socketFile,
             MuxIn_Open,
-            &s_dataPtr->mux);
+            mux);
 
         if (r != MI_RESULT_OK)
         {
-            err(ZT("Protocol_New_Listener() failed: %T\n"), socketFile);
+            err(ZT("Protocol_New_Listener() failed: %T"), socketFile);
+        }
+    }
+}
+
+void BinaryProtocolListenSock(Sock sock, MuxIn *mux, ProtocolSocketAndBase **protocol)
+{
+    MI_Result r;
+
+    /* mux */
+    {
+        if(MuxIn_Init(mux, RequestCallback, &s_dataPtr->protocolData, NULL, PostResultMsg_NewAndSerialize) != MI_RESULT_OK)
+            err(ZT("MuxIn_Init() failed"));
+    }
+        
+    /* Create new protocol object */
+    {
+        r = ProtocolSocketAndBase_New_Agent(
+            protocol, 
+            &s_dataPtr->selector, 
+            sock,
+            MuxIn_Open,
+            mux);
+
+        if (r != MI_RESULT_OK)
+        {
+            err(ZT("Protocol_New_Listener() failed."));
         }
     }
 }
@@ -1084,7 +1112,7 @@ void RunProtocol()
             }
         }
 
-        r = Protocol_Run(s_dataPtr->protocol, ONE_SECOND_USEC);
+        r = Selector_Run(&s_dataPtr->selector, ONE_SECOND_USEC, MI_FALSE);
 
         if (r != MI_RESULT_TIME_OUT)
             break;
@@ -1137,7 +1165,9 @@ void RunProtocol()
         }
     }
 
-    ProtocolBase_Delete(s_dataPtr->protocol);
+    ProtocolBase_Delete(s_dataPtr->protocol0);
+    if (s_dataPtr->protocol1)
+        ProtocolBase_Delete(&s_dataPtr->protocol1->internalProtocolBase);
     Selector_Destroy(&s_dataPtr->selector);
 
     /* Shutdown the network */

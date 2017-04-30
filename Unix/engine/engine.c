@@ -77,7 +77,7 @@ int enginemain(int argc, const char* argv[])
         WsmanProtocolListen();
 
         const char *path = OMI_GetPath(ID_SOCKETFILE);
-        BinaryProtocolListen(path);
+        BinaryProtocolListenFile(path, &s_data.mux[0], &s_data.protocol0);
 
         RunProtocol();
     }

@@ -29,7 +29,7 @@ static int _StartEngine(int argc, char** argv, const char *sockFile)
     Strlcat(engineFile, "/omiengine", PAL_MAX_PATH_SIZE);
     argv[0] = engineFile;
 
-    BinaryProtocolListen(sockFile);
+    BinaryProtocolListenFile(sockFile, &s_data.mux[0], &s_data.protocol0);
     
     if(socketpair(AF_UNIX, SOCK_STREAM, 0, s) != 0)
     {
@@ -46,11 +46,16 @@ static int _StartEngine(int argc, char** argv, const char *sockFile)
 
     child = fork();
     if (child < 0)
+    {
+        err(PAL_T("fork failed"));
         return -1;  
+    }
 
     if (child > 0)   // parent
     {
         Sock_Close(s[1]);
+        BinaryProtocolListenSock(s[0], &s_data.mux[1], &s_data.protocol1);
+
         return 0;
     }
 
@@ -399,7 +404,7 @@ int servermain(int argc, const char* argv[])
 
             WsmanProtocolListen();
 
-            BinaryProtocolListen(OMI_GetPath(ID_SOCKETFILE));
+            BinaryProtocolListenFile(OMI_GetPath(ID_SOCKETFILE), &s_data.mux[0], &s_data.protocol0);
         }
 
         RunProtocol();
