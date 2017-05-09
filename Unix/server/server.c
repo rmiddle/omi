@@ -14,8 +14,9 @@
 #include <server/server.h>
 
 static Options s_opts;
-
 static ServerData s_data;
+#define S_SOCKET_LENGTH 8
+static char s_socket[S_SOCKET_LENGTH];
 
 static int _StartEngine(int argc, char** argv, const char *sockFile)
 {
@@ -24,6 +25,7 @@ static int _StartEngine(int argc, char** argv, const char *sockFile)
     pid_t child;
     int fdLimit;
     int fd;
+    int size;
 
     Strlcpy(engineFile, OMI_GetPath(ID_BINDIR), PAL_MAX_PATH_SIZE);
     Strlcat(engineFile, "/omiengine", PAL_MAX_PATH_SIZE);
@@ -85,6 +87,8 @@ static int _StartEngine(int argc, char** argv, const char *sockFile)
             close(fd);
     }
 
+    argv[argc-1] = int64_to_a(s_socket, S_SOCKET_LENGTH, (long long)s[1], &size);
+
     execv(argv[0], argv);
     err(PAL_T("Launch failed"));
     exit(1);
@@ -94,17 +98,20 @@ static char** _DuplicateArgv(int argc, const char* argv[])
 {
     int i;
 
-    char **newArgv = malloc((argc+1)*sizeof(char*));
+    char **newArgv = (char**)malloc((argc+3)*sizeof(char*));
 
     // argv[0] will be filled in later
     if (argc > 1)
     {
         for (i = 1; i<argc; ++i)
         {
-            newArgv[i] = strdup(argv[i]);
+            newArgv[i] = (char*)argv[i];
         }
     }
-    newArgv[argc] = NULL;
+
+    newArgv[argc] = "--socketpair";
+    newArgv[argc+1] = NULL;  // to be filled later
+    newArgv[argc+2] = NULL;
 
     return newArgv;
 }
@@ -157,7 +164,7 @@ static int _CreateSockFile(char* buffer, int size)
     else
     {
         int r;
-        r = Mkdir(sockDir, 700);
+        r = Mkdir(sockDir, 0700);
         if (r != 0)
         {
             err(PAL_T("failed to create sockets directory: %T"), tcs(sockDir));
@@ -218,17 +225,15 @@ int servermain(int argc, const char* argv[])
     char **engine_argv = NULL;
     char socketFile[PAL_MAX_PATH_SIZE];
 
-    serverType = OMI_SERVER;
     arg0 = argv[0];
-    memset(&s_data, 0, sizeof(s_data));
 
-    SetDefaults(&s_opts, &s_data, arg0);
+    SetDefaults(&s_opts, &s_data, arg0, OMI_SERVER);
 
     // Determine if we're running with non-root option
     _GetCommandLineNonRootOption(&argc, argv);
     if (s_opts.nonRoot == MI_TRUE)
     {
-        engine_argc = argc;
+        engine_argc = argc + 2;
         engine_argv = _DuplicateArgv(argc, argv);
     }
 
@@ -368,7 +373,7 @@ int servermain(int argc, const char* argv[])
 
     if (s_opts.nonRoot == MI_TRUE)
     {
-        int i, r;
+        int r;
 
         r = _CreateSockFile(socketFile, PAL_MAX_PATH_SIZE);
         if (r != 0)
@@ -386,13 +391,6 @@ int servermain(int argc, const char* argv[])
             exit(1);
         }
 
-        if (engine_argc > 1)
-        {
-            for (i=1; i<engine_argc; ++i)
-            {
-                free(engine_argv[i]);
-            }
-        }
         free(engine_argv);
     }
 

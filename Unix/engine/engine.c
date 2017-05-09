@@ -19,11 +19,9 @@ int enginemain(int argc, const char* argv[])
     int pidfile = -1;
 #endif
 
-    serverType = OMI_ENGINE;
     arg0 = argv[0];
-    memset(&s_data, 0, sizeof(s_data));
 
-    SetDefaults(&s_opts, &s_data, arg0);
+    SetDefaults(&s_opts, &s_data, arg0, OMI_ENGINE);
 
     /* Get --destdir command-line option */
     GetCommandLineDestDirOption(&argc, argv);

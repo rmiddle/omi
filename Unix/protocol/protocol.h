@@ -35,6 +35,9 @@ typedef enum _Protocol_AuthState
     /* listener (server) waits for second connect request with random data from file */
     PRT_AUTH_WAIT_CONNECTION_REQUEST_WITH_FILE_DATA,
 
+    /* listener (engine) has forwarded connect request to server */
+    PRT_AUTH_FORWARDED_REQUEST,
+
     /* connector (client) waits for server's response */
     PRT_AUTH_WAIT_CONNECTION_RESPONSE,
 
@@ -71,6 +74,7 @@ typedef struct _ProtocolBase
     Protocol_Type       type;
     /* Indicates whether instance has to be upacked or stored as byte array */
     MI_Boolean          skipInstanceUnpack;
+    MI_Boolean          forwardRequests;       // true if in nonroot mode and msg should be forwarded
 }
 ProtocolBase;
 

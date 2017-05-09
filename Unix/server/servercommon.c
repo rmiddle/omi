@@ -11,6 +11,7 @@
 
 static Options *s_optsPtr = NULL;
 static ServerData *s_dataPtr = NULL;
+static ServerType serverType = OMI_SERVER;
 
 static Lock s_disp_mutex = LOCK_INITIALIZER;
 
@@ -60,7 +61,7 @@ void PrintProviderMsg(_In_ Message* msg)
     It just sends a noop response and closes the interaction
     (therefore shutting down)
 */
-void NoopInteractionAck( _In_ Strand* self) 
+void _NoopInteractionAck( _In_ Strand* self) 
 {
     // do nothing
 }
@@ -68,7 +69,7 @@ void NoopInteractionAck( _In_ Strand* self)
 StrandFT _NoopInteractionUserFT = { 
         NULL, 
         NULL, 
-        NoopInteractionAck, 
+        _NoopInteractionAck, 
         NULL, 
         NULL, 
         NULL,
@@ -128,7 +129,7 @@ void GetCommandLineDestDirOption(
  *
  * Returns 0 if parameter was good, non-zero if parameter was bad
  */
-int ParseHttpPortSpecification(unsigned short **ports, int *size, const char *spec, unsigned short defport)
+int _ParseHttpPortSpecification(unsigned short **ports, int *size, const char *spec, unsigned short defport)
 {
     // defport is unused (no longer support "+" to add default port
     (void) defport;
@@ -245,7 +246,7 @@ void GetCommandLineOptions(
         "--localstatedir:",
         "--sysconfdir:",
         "--providerdir:",
-                "--registerdir:",
+        "--registerdir:",
         "--certsdir:",
         "--rundir:",
         "--logdir:",
@@ -263,6 +264,7 @@ void GetCommandLineOptions(
         "--testopts",
         "--reload-dispatcher",
         "--service:",
+        "--socketpair:",
         NULL,
     };
 
@@ -343,7 +345,7 @@ void GetCommandLineOptions(
 #endif
         else if (strcmp(state.opt, "--httpport") == 0)
         {
-            if ( ParseHttpPortSpecification(&s_optsPtr->httpport, &s_optsPtr->httpport_size, state.arg, CONFIG_HTTPPORT) )
+            if ( _ParseHttpPortSpecification(&s_optsPtr->httpport, &s_optsPtr->httpport_size, state.arg, CONFIG_HTTPPORT) )
             {
                 err(ZT("bad option argument for --httpport: %s"), 
                     scs(state.arg));
@@ -351,7 +353,7 @@ void GetCommandLineOptions(
         }
         else if (strcmp(state.opt, "--httpsport") == 0)
         {
-            if ( ParseHttpPortSpecification(&s_optsPtr->httpsport, &s_optsPtr->httpsport_size, state.arg, CONFIG_HTTPSPORT) )
+            if ( _ParseHttpPortSpecification(&s_optsPtr->httpsport, &s_optsPtr->httpsport_size, state.arg, CONFIG_HTTPSPORT) )
             {
                 err(ZT("bad option argument for --httpsport: %s"), 
                     scs(state.arg));
@@ -408,6 +410,18 @@ void GetCommandLineOptions(
                 err(ZT("bad option argument for %s: %s"), 
                     scs(state.opt), scs(state.arg));
             }
+        }
+        else if (strcmp(state.opt, "--socketpair") == 0)
+        {
+            char *end = NULL;
+            long port = Strtol(state.arg, &end, 10);
+            if (port == LONG_MIN || port == LONG_MAX)
+            {
+                err(ZT("bad option argument for %s: %s"), 
+                    scs(state.opt), scs(state.arg));
+            }
+            s_optsPtr->socketpairPort = port;
+
         }
         else if (strcmp(state.opt, "--testopts") == 0)
         {
@@ -538,7 +552,7 @@ void GetConfigFileOptions()
 
         if (strcmp(key, "httpport") == 0)
         {
-            if ( ParseHttpPortSpecification(&s_optsPtr->httpport, &s_optsPtr->httpport_size, value, CONFIG_HTTPPORT) )
+            if ( _ParseHttpPortSpecification(&s_optsPtr->httpport, &s_optsPtr->httpport_size, value, CONFIG_HTTPPORT) )
             {
                 err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
                     Conf_Line(conf), scs(key), scs(value));
@@ -546,7 +560,7 @@ void GetConfigFileOptions()
         }
         else if (strcmp(key, "httpsport") == 0)
         {
-            if ( ParseHttpPortSpecification(&s_optsPtr->httpsport, &s_optsPtr->httpsport_size, value, CONFIG_HTTPSPORT) )
+            if ( _ParseHttpPortSpecification(&s_optsPtr->httpsport, &s_optsPtr->httpsport_size, value, CONFIG_HTTPSPORT) )
             {
                 err(ZT("%s(%u): invalid value for '%s': %s"), scs(path), 
                     Conf_Line(conf), scs(key), scs(value));
@@ -752,11 +766,14 @@ void GetConfigFileOptions()
     return;
 }
 
-void SetDefaults(_In_ Options *opts_ptr, _In_ ServerData *data_ptr, const char *executable)
+void SetDefaults(Options *opts_ptr, ServerData *data_ptr, const char *executable, ServerType type)
 {
     s_optsPtr = opts_ptr;
     s_dataPtr = data_ptr;
     arg0 = executable;
+    serverType = type;
+
+    memset(s_dataPtr, 0, sizeof(ServerData));
 
     s_optsPtr->httpport = PAL_Malloc(sizeof(unsigned short));
     s_optsPtr->httpport[0] = CONFIG_HTTPPORT;
@@ -774,6 +791,7 @@ void SetDefaults(_In_ Options *opts_ptr, _In_ ServerData *data_ptr, const char *
     s_optsPtr->serviceAccount = "omi_service";
     s_optsPtr->serviceAccountUID = -1;
     s_optsPtr->serviceAccountGID = -1;
+    s_optsPtr->socketpairPort = (Sock)-1;
 
     /* Initialize calback parameters */
     s_dataPtr->protocolData.data = s_dataPtr;
@@ -1048,6 +1066,8 @@ void BinaryProtocolListenFile(const char *socketFile, MuxIn *mux, ProtocolBase *
         {
             err(ZT("Protocol_New_Listener() failed: %T"), socketFile);
         }
+
+        (*protocol)->forwardRequests = (serverType == OMI_ENGINE) ? MI_TRUE : MI_FALSE;
     }
 }
 
@@ -1074,6 +1094,8 @@ void BinaryProtocolListenSock(Sock sock, MuxIn *mux, ProtocolSocketAndBase **pro
         {
             err(ZT("Protocol_New_Listener() failed."));
         }
+
+        (*protocol)->internalProtocolBase.forwardRequests = (serverType == OMI_ENGINE) ? MI_TRUE : MI_FALSE;
     }
 }
 
@@ -1186,13 +1208,16 @@ void ServerCleanup(int pidfile)
     s_optsPtr->httpport_size = s_optsPtr->httpsport_size = 0;
 
 #if defined(CONFIG_POSIX)
-    /* Close PID file */
-    close(pidfile);
-
-    /* Remove PID file */
-    if (PIDFile_Delete() != 0)
+    if (pidfile != -1)
     {
-        trace_FailedRemovePIDFile(scs(OMI_GetPath(ID_PIDFILE)));
+        /* Close PID file */
+        close(pidfile);
+
+        /* Remove PID file */
+        if (PIDFile_Delete() != 0)
+        {
+            trace_FailedRemovePIDFile(scs(OMI_GetPath(ID_PIDFILE)));
+        }
     }
 #endif
 

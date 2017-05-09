@@ -133,17 +133,20 @@ typedef struct _Options
     const char *serviceAccount;
     uid_t serviceAccountUID;
     gid_t serviceAccountGID;
+    Sock socketpairPort;
 }
 Options;
 
+typedef enum _ServerType { OMI_SERVER, OMI_ENGINE } ServerType;
+
+static const char* arg0 = 0;
+
+
 void PrintProviderMsg(_In_ Message* msg);
-void NoopInteractionAck(_In_ Strand* self);
-void ProcessNoopRequest(_Inout_ InteractionOpenParams*  params);
 void GetCommandLineDestDirOption(int* argc_, const char* argv[]);
-int ParseHttpPortSpecification(unsigned short **ports, int *size, const char *spec, unsigned short defport);
 void GetCommandLineOptions(int* argc_, const char* argv[]);
 void OpenLogFile();
-void SetDefaults(_In_ Options *opts_ptr, _In_ ServerData *data_ptr, const char *executable);
+void SetDefaults(Options *opts_ptr, ServerData *data_ptr, const char *executable, ServerType type);
 void HandleSIGUSR1(int sig);
 void GetConfigFileOptions();
 void HandleSIGTERM(int sig);
@@ -159,10 +162,5 @@ void WsmanProtocolListen();
 void RunProtocol();
 void InitializeNetwork();
 void ServerCleanup(int pidfile);
-
-typedef enum _ServerType { OMI_SERVER, OMI_ENGINE }ServerType;
-ServerType serverType;
-
-static const char* arg0 = 0;
 
 #endif /* _server_h */
