@@ -460,7 +460,8 @@ static MI_Boolean _SendAuthRequest(
     ProtocolSocket* h,
     const char* user,
     const char* password,
-    const char* fileContent)
+    const char* fileContent,
+    Sock returnSock)
 {
     BinProtocolNotification* req;
     MI_Boolean retVal = MI_TRUE;
@@ -469,6 +470,8 @@ static MI_Boolean _SendAuthRequest(
 
     if (!req)
         return MI_FALSE;
+
+    req->clientSock = returnSock;
 
     if (user && *user)
     {
@@ -517,7 +520,8 @@ static MI_Boolean _SendAuthRequest(
 static MI_Boolean _SendAuthResponse(
     ProtocolSocket* h,
     MI_Result result,
-    const char* path)
+    const char* path,
+    Sock returnSock)
 {
     BinProtocolNotification* req;
     MI_Boolean retVal = MI_TRUE;
@@ -526,6 +530,8 @@ static MI_Boolean _SendAuthResponse(
 
     if (!req)
         return MI_FALSE;
+
+    req->clientSock = returnSock;
 
     req->result = result;
     if (path && *path)
@@ -579,7 +585,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequestFileData(
 
     if (0 == memcmp(binMsg->authData, handler->authData->authRandom, AUTH_RANDOM_DATA_SIZE))
     {
-        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL))
+        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL, binMsg->clientSock))
             return MI_FALSE;
 
         /* Auth ok */
@@ -599,7 +605,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequestFileData(
     trace_AuthFailed_RandomDataMismatch();
 
     /* Auth failed */
-    _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL);
+    _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL, binMsg->clientSock);
     handler->authState = PRT_AUTH_FAILED;
     return MI_FALSE;
 }
@@ -633,7 +639,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
         if (0 == AuthenticateUser(binMsg->user, binMsg->password) &&
             0 == LookupUser(binMsg->user, &handler->authInfo.uid, &handler->authInfo.gid))
         {
-            if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL))
+            if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL, binMsg->clientSock))
                 return MI_FALSE;
 
             /* Auth ok */
@@ -645,7 +651,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
         trace_AuthFailed_ForUser(scs(binMsg->user));
 
         /* Auth failed */
-        _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL);
+        _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL, binMsg->clientSock);
         handler->authState = PRT_AUTH_FAILED;
         return MI_FALSE;
     }
@@ -654,7 +660,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
         implicit auth */
     if (0 == GetUIDByConnection((int)handler->base.sock, &handler->authInfo.uid, &handler->authInfo.gid))
     {
-        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL))
+        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL, binMsg->clientSock))
             return MI_FALSE;
 
         /* Auth ok */
@@ -663,7 +669,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
     }
 #if defined(CONFIG_OS_WINDOWS)
     {
-        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL))
+        if (!_SendAuthResponse(handler, MI_RESULT_OK, NULL, binMsg->clientSock))
             return MI_FALSE;
 
         /* Ignore Auth by setting it to OK */
@@ -682,7 +688,7 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
         if (!handler->authData)
         {
             /* Auth failed */
-            _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL);
+            _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL, binMsg->clientSock);
             handler->authState = PRT_AUTH_FAILED;
             return MI_FALSE;
         }
@@ -692,13 +698,13 @@ static MI_Boolean _ProcessAuthMessageWaitingConnectRequest(
             trace_CannotCreateFileForUser((int)binMsg->uid);
 
             /* Auth failed */
-            _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL);
+            _SendAuthResponse(handler, MI_RESULT_ACCESS_DENIED, NULL, binMsg->clientSock);
             handler->authState = PRT_AUTH_FAILED;
             return MI_FALSE;
         }
 
         /* send file name to the client */
-        if (!_SendAuthResponse(handler, MI_RESULT_IN_PROGRESS, handler->authData->path))
+        if (!_SendAuthResponse(handler, MI_RESULT_IN_PROGRESS, handler->authData->path, binMsg->clientSock))
             return MI_FALSE;
 
         /* Auth posponed */
@@ -790,7 +796,7 @@ static MI_Boolean _ProcessAuthMessage(
             }
 
             File_Close(is);
-            return _SendAuthRequest(handler, 0, 0, buf);
+            return _SendAuthRequest(handler, 0, 0, buf, -1);
         }
         else
         {
@@ -1015,15 +1021,37 @@ static Protocol_CallbackResult _ProcessReceivedMessage(
                 if (msg->tag == BinProtocolNotificationTag)
                 {
                     BinProtocolNotification* binMsg = (BinProtocolNotification*) msg;                    
-                    Sock s = protocolBase->forwardingPort[MessageTagIndex(msg->tag)];
-                    
-                    handler->base.sock = s;
-                    handler->authState = PRT_AUTH_WAIT_CONNECTION_RESPONSE;
-                    handler->base.mask = SELECTOR_READ | SELECTOR_WRITE | SELECTOR_EXCEPTION;
-
-                    if( s > 0 && _SendAuthRequest(handler, binMsg->user, binMsg->password, NULL) )                
+                    if (binMsg->type == BinNotificationConnectRequest)
                     {
-                        ret = PRT_CONTINUE;
+                        // forward to server
+                        Sock s = protocolBase->forwardingPort[MessageTagIndex(msg->tag)];
+                        Sock clientSock = handler->base.sock;
+
+                        handler->base.sock = s;
+                        handler->authState = PRT_AUTH_WAIT_CONNECTION_RESPONSE;
+                        handler->base.mask = SELECTOR_READ | SELECTOR_WRITE | SELECTOR_EXCEPTION;
+
+                        if( s > 0 && _SendAuthRequest(handler, binMsg->user, binMsg->password, NULL, clientSock) )                
+                        {
+                            ret = PRT_CONTINUE;
+                        }
+                    }
+                    else if (binMsg->type == BinNotificationConnectResponse)
+                    {
+                        // forward to client
+                        Sock s = binMsg->clientSock;
+                    
+                        handler->base.sock = s;
+                        if (binMsg->result == MI_RESULT_OK)
+                        {
+                            handler->authState = PRT_AUTH_OK;
+                        }
+                        handler->base.mask = SELECTOR_READ | SELECTOR_WRITE | SELECTOR_EXCEPTION;
+
+                        if( s > 0 && _SendAuthResponse(handler, binMsg->result, binMsg->authFile, -1) )                
+                        {
+                            ret = PRT_CONTINUE;
+                        }
                     }
                 }
             }
@@ -1762,7 +1790,7 @@ MI_Result ProtocolSocketAndBase_New_Connector(
         }
 
         /* send connect request */
-        if( !_SendAuthRequest(h, user, password, NULL) )
+        if( !_SendAuthRequest(h, user, password, NULL, -1) )
         {
             // this will call _RequestCallback which will schedule a CloseOther,
             // but that is not going delete the object (since it is not even truly opened),
