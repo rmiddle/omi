@@ -1010,8 +1010,28 @@ static Protocol_CallbackResult _ProcessReceivedMessage(
 
         if (PRT_AUTH_OK != handler->authState)
         {
-            if( _ProcessAuthMessage(handler, msg) )
-                ret = PRT_CONTINUE;
+            if (protocolBase->forwardRequests == MI_TRUE)
+            {
+                if (msg->tag == BinProtocolNotificationTag)
+                {
+                    BinProtocolNotification* binMsg = (BinProtocolNotification*) msg;                    
+                    Sock s = protocolBase->forwardingPort[MessageTagIndex(msg->tag)];
+                    
+                    handler->base.sock = s;
+                    handler->authState = PRT_AUTH_WAIT_CONNECTION_RESPONSE;
+                    handler->base.mask = SELECTOR_READ | SELECTOR_WRITE | SELECTOR_EXCEPTION;
+
+                    if( s > 0 && _SendAuthRequest(handler, binMsg->user, binMsg->password, NULL) )                
+                    {
+                        ret = PRT_CONTINUE;
+                    }
+                }
+            }
+            else
+            {
+                if( _ProcessAuthMessage(handler, msg) )
+                    ret = PRT_CONTINUE;
+            }
         }
         else
         {

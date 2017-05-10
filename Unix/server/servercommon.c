@@ -937,6 +937,14 @@ void FUNCTION_NEVER_RETURNS info_exit(const ZChar* fmt, ...)
     exit(0);
 }
 
+void _AddForwardingPort(ProtocolBase *protocol, MessageTag msgTag, Sock s)
+{
+    uint index = MessageTagIndex(msgTag);
+    if (index > MAX_FORWARDING_PORTS - 1)
+        err(ZT("unable to add forwarding port: %d"), index);
+    protocol->forwardingPort[index] = s;
+}
+
 void InitializeNetwork()
 {
     MI_Result r;
@@ -1046,6 +1054,7 @@ void WsmanProtocolListen()
 void BinaryProtocolListenFile(const char *socketFile, MuxIn *mux, ProtocolBase **protocol)
 {
     MI_Result r;
+    int i;
 
     /* mux */
     {
@@ -1067,7 +1076,17 @@ void BinaryProtocolListenFile(const char *socketFile, MuxIn *mux, ProtocolBase *
             err(ZT("Protocol_New_Listener() failed: %T"), socketFile);
         }
 
-        (*protocol)->forwardRequests = (serverType == OMI_ENGINE) ? MI_TRUE : MI_FALSE;
+        if (serverType == OMI_ENGINE)
+        {
+            (*protocol)->forwardRequests = MI_TRUE;
+            for (i=0; i<MAX_FORWARDING_PORTS; ++i)
+                (*protocol)->forwardingPort[i] = -1;
+            _AddForwardingPort(*protocol, BinProtocolNotificationTag, s_optsPtr->socketpairPort);
+        }
+        else
+        {
+            (*protocol)->forwardRequests = MI_FALSE;
+        }
     }
 }
 
@@ -1095,7 +1114,15 @@ void BinaryProtocolListenSock(Sock sock, MuxIn *mux, ProtocolSocketAndBase **pro
             err(ZT("Protocol_New_Listener() failed."));
         }
 
-        (*protocol)->internalProtocolBase.forwardRequests = (serverType == OMI_ENGINE) ? MI_TRUE : MI_FALSE;
+        (*protocol)->protocolSocket.authState = PRT_AUTH_WAIT_CONNECTION_REQUEST;
+        if (serverType == OMI_ENGINE)
+        {
+            (*protocol)->internalProtocolBase.forwardRequests = MI_TRUE;
+        }
+        else
+        {
+            (*protocol)->internalProtocolBase.forwardRequests = MI_FALSE;
+        }
     }
 }
 
