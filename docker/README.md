@@ -75,3 +75,19 @@ Enter docker container to check any issues
 ```
 docker exec -it <container_id|container_name> /bin/bash
 ```
+
+How to Collect Docker Container Performance Metrics using OMI/OMI provider in Docker Container
+-------
+
+OMI/OMI provider can work on containers, just make sure you know following notes:
+- OMI/OMI provider can collect containers performance metrics in a normal container, but you cannot collect virtual machine host's performance metrics in container.
+- Multiple OMI instances can run in different containers if they are mapped to different ports on the host system.
+- To be able to collect container performance metrics, there are three ways docker supports this: pseudo-files, docker stats command and the Remote API, and Docker doesn't need to run with a privileged container. you can use [ContainerStatisticsProvider], or you can implement a similar provider. If you wish to use [ContainerStatisticsProvider], this ships with [OMS]. You can either install [OMS] itself, or you can extract [ContainerStatisticsProvider] from the [OMS] bundle and install that provider independently.
+  - To collect all container's status (including or not including itself) on RHEL and CentOS, you need to run a privileged container with --privileged=true if you use docker remote api, or you need to mount /cgroup with --volume=/cgroup:/cgroup:ro if you use pseudo-files to collect container performance information.
+  - To use docker remote api, you can refer to [Docker API], and to collect perf using docker api, you can refer to [How to collect docker metrics].
+
+[OMS]: https://github.com/Microsoft/OMS-Agent-for-Linux
+[Docker API]: https://docs.docker.com/engine/api/get-started/
+[How to collect docker metrics]:https://www.datadoghq.com/blog/how-to-collect-docker-metrics
+[ContainerStatisticsProvider]: https://github.com/Microsoft/Docker-Provider/blob/master/source/code/providers/Container_ContainerStatistics_Class_Provider.cpp
+

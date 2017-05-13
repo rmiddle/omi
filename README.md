@@ -135,6 +135,16 @@ sslCipherSuite | The prioritized list of allowed SSL/TLS ciphers. For more infor
 
 Similar to configuring the server, the client configuration file is located at `/etc/opt/omi/conf/omicli.conf`.
 
+### How to Collect Virtual Machine Performance Metrics using OMI/OMI Provider on Virtual Machine Host
+
+OMI/OMI provider can work on virtual machines, just make sure you know following notes:
+- OMI/OMI provider can collect virtual machine performance metrics as in physical machine.
+- Basically, you only can run one OMI instance in one virtual machine, and one OMI instance can run multiple OMI providers without issue.
+- OMI itself does not ship with a provider that collects machine performance metrics. OMI does not ship with any providers at all, these must be developed and installed separately.
+- For how to collect docker container performance metrics using OMI/OMI provider in docker container, you can refer to [Docker for OMI].
+
+[Docker for OMI]:https://github.com/Microsoft/omi/blob/master/docker/README.md
+
 ### Code of Conduct
 
 This project has adopted the [Microsoft Open Source Code of Conduct]
